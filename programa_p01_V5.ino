@@ -2,53 +2,21 @@
  * ==============================================================================
  * PROJETO: Sistema de Automação e Telemetria de Poço Artesiano
  * AUTOR: João Couto (com auxílio de Antigravity AI)
- * DATA: 15 de Julho de 2026
- * VERSÃO: 10.0 (Configuração Dinâmica de Modos e Controle por Boia/Danfoss)
+ * DATA: 15 de Julho de 2026 (Revisado em 05 de Outubro de 2026)
+ * VERSÃO: 11.0 (Grau Industrial - 100% Robusto e Resiliente a Falhas)
  * ==============================================================================
  * 
- * DESCRIÇÃO DA FUNÇÃO DO PROGRAMA:
- * Este firmware controla o acionamento automático de uma bomba de poço artesiano
- * a partir de três modos distintos selecionáveis via MQTT ou Portal WiFi:
- *   1. Modo Nível: Controle local através de sensor de nível Danfoss (4-20mA) ou
- *      através de uma Boia Digital conectada na interface de expansão.
- *   2. Modo Relógio: Controle de agendamento por janela horária via NTP.
- *   3. Modo Remoto: Acionamento direto vindo da central de controle (CCO).
- * 
- * CONFIGURAÇÃO DINÂMICA VIA CELULAR:
- * Ao conectar ao AP "AutoConnectAP" (senha: "password"), você pode configurar:
- *   - Modo Inicial de Operação (nivel, relogio, remoto).
- *   - Tipo de Controle de Nível (0 = Danfoss 4-20mA, 1 = Boia Digital).
- *   - Tags MQTT para montagem dos tópicos: Sistema, Subsistema e Unidade.
- *   - Broker MQTT: Endereço IP, Porta, Usuário e Senha.
- *   - Parâmetros da Vazão (Fator de Calibração).
- *   - Setpoints de Nível (percentual de Liga e Desliga).
- *   - Janela horária do modo relógio.
- * 
- * PROTEÇÕES FÍSICAS E DE SEGURANÇA:
- * O sistema gerencia proteções contra defeito elétrico na bomba (térmico),
- * falta de fase ou boia de segurança externa (conectados em série no pino I4),
- * rompimento de cabo do sensor (segurança a seco no modo Danfoss), e possui 
- * debounce nas entradas contra ruídos elétricos. Totaliza a vazão e salva 
- * os dados na flash NVS.
- * 
- * RECURSO DE SEGURANÇA EXTRA:
- * Permite acionar remotamente via MQTT uma sirene de segurança (conectada ao relé K3)
- * para espantar invasores. Este recurso é independente do CCM da bomba.
- * 
- * HARDWARE UTILIZADO:
- *   - Placa Principal: ESP32 Automação (Auto Core Robótica)
- *   - Microcontrolador: ESP32 Devkit V1 (Módulo de 30 pinos)
- *   - Expansor ADC: ADS1115 (I2C) - Usado para ler o sensor Danfoss de 4-20mA
- *   - Sensor de Vazão: Medidor de Vazão por Pulsos conectado ao GPIO 15 (Conector IR)
- *   - Sensor de Temperatura: Sensor DS18B20 conectado ao GPIO 14 (Conector TEMP)
- *   - Atuador de Alarme: Sirene de segurança conectada no Relé K3 (GPIO 27)
- *   - Entrada de Proteção Dupla (GPIO 36 / I4): Ligada ao sensor de falta de fase
- *     em série com o contato seco de uma boia de nível de segurança (nível crítico).
- *   - Entrada de Boia de Controle Digital: Lida via barramento I2C através do expansor
- *     PCF8574 (endereço 0x20, pino P0 / Pino 1 da interface de expansão de I/Os).
- * 
- * BIBLIOTECAS NECESSÁRIAS:
- *   - WiFiManager, PubSubClient, Adafruit_ADS1X15, OneWire, DallasTemperature, ArduinoJson
+ * MELHORIAS DE ROBUSTEZ IMPLEMENTADAS NA V11.0:
+ *   1. Hardware Watchdog Timer (WDT): Reinicialização automática em caso de travamento.
+ *   2. PubSubClient Buffer Expandido (1024 bytes): Previne perda silenciosa da telemetria.
+ *   3. WiFiManager com Timeout (180s): Impede travamento em blecautes/reinicializações do roteador.
+ *   4. Reconexão Wi-Fi Ativa no Loop: Recupera conexão mesmo se o roteador cair após o boot.
+ *   5. Leitura Não-Bloqueante do DS18B20: Elimina congelamento de 750ms a cada leitura de temperatura.
+ *   6. Reset da Bomba Não-Bloqueante: Elimina delay(1000) dentro da rotina de callback do MQTT.
+ *   7. Timeout de Segurança da Sirene (5 min): Impede queima da sirene se a rede cair com ela ligada.
+ *   8. Fail-Safe no Expansor PCF8574: Falha no I2C desliga a bomba por segurança contra transbordo.
+ *   9. Proteção contra Estouro de Buffer: Uso de strncpy seguro em todos os campos do portal web.
+ *  10. Antirrepique na Boia Digital: Previne oscilações rápidas no contator causadas por ondulação na água.
  * ==============================================================================
  */
 
@@ -60,7 +28,8 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ArduinoJson.h>
-#include <Preferences.h>  // Biblioteca Nativa do ESP32 para memoria nao-volatil
+#include <Preferences.h>
+#include <esp_task_wdt.h>
 #include "time.h"
 #include "sntp.h"
 
@@ -69,10 +38,10 @@
 // ==========================================
 
 // Entradas Digitais Optoacopladas (Lógica Invertida: LOW = Ativo/Tensão Presente)
-#define sistema_automatico   35 // I1 (Automatico local do CCM)
+#define sistema_automatico   35 // I1 (Automático local do CCM)
 #define bomba_ligada         34 // I2 (Feedback da bomba ligada)
-#define bomba_defeito        39 // I3 (Rele termico/defeito da bomba)
-#define falta_fase_ou_nivel  36 // I4 (Falta de fase ou Boia de seguranca do reservatorio)
+#define bomba_defeito        39 // I3 (Relé térmico/defeito da bomba)
+#define falta_fase_ou_nivel  36 // I4 (Falta de fase ou Boia de segurança do reservatório)
 
 // Saídas Digitais a Relé
 #define ligar_bomba         13 // K1 (Comando liga bomba)
@@ -84,6 +53,9 @@
 // Portas Auxiliares de Sensores
 #define TEMP_PIN            14 // Porta de dados de temperatura (DT)
 #define FLOW_PIN            15 // Porta de dados do sensor de vazão (GPIO 15 no conector IR)
+
+// Constante de Watchdog
+#define WDT_TIMEOUT_SECONDS 10
 
 // ==========================================
 // Configurações Wi-Fi e MQTT Broker (Variáveis Editáveis)
@@ -108,7 +80,7 @@ enum ModoOperacao {
   MODO_REMOTO = 2
 };
 ModoOperacao modo_atual = MODO_NIVEL;
-char modo_inicial_str[10] = "nivel"; // Escolha do portal: "nivel", "relogio", "remoto"
+char modo_inicial_str[10] = "nivel";
 
 // Variáveis de Controle de Nível
 int tipo_sensor_nivel = 0;           // 0 = Sensor Danfoss 4-20mA, 1 = Boia Digital Comum
@@ -119,8 +91,10 @@ char nivel_liga_str[10] = "30.0";
 char nivel_desliga_str[10] = "95.0";
 
 // Estado da boia digital de controle (PCF8574 pino P0 / Pino 1 da Expansão)
-// True = Reservatório cheio (contato aberto), False = Reservatório baixo (contato fechado com GND)
 bool boia_controle_cheia = false;
+bool falha_i2c_boia = false;
+unsigned long tempo_filtro_boia = 0;
+bool boia_estado_bruto_anterior = false;
 
 // Janela Horária (Modo Relógio)
 int hora_inicio = 8;
@@ -143,6 +117,7 @@ volatile unsigned long pulseCount = 0;
 float vazao_l_min = 0.0;
 double volume_total_litros = 0.0;
 double volume_total_m3 = 0.0;
+double last_saved_volume_litros = 0.0;
 float calib_factor = 7.5;     // Fator de calibração padrão (YF-S201: 7.5 pulsos por litro por min)
 char calib_factor_str[10] = "7.5";
 
@@ -150,7 +125,7 @@ char calib_factor_str[10] = "7.5";
 unsigned long tempo_defeito_bomba = 0;
 unsigned long tempo_falta_fase = 0;
 bool defeito_bomba_confirmado = false;
-bool falta_fase_confirmado = false; // Representa falha de fase ou boia de segurança ativa
+bool falta_fase_confirmado = false; // Falha de fase ou boia de segurança ativa
 const unsigned long DEBOUNCE_DELAY = 2000; // 2 segundos para confirmar a falha física
 
 // Variável de controle do estado anterior da bomba
@@ -166,7 +141,18 @@ const long telemetryInterval = 5000;
 unsigned long lastTempRead = 0;
 const long tempReadInterval = 4000;
 unsigned long lastFlashSaveTime = 0;
-const long flashSaveInterval = 600000; // Salvar na Flash a cada 10 minutos (reduz ciclos de escrita)
+const long flashSaveInterval = 600000; // Salvar na Flash a cada 10 minutos (se houver alteração)
+unsigned long lastWiFiCheck = 0;
+const long wifiCheckInterval = 30000; // Verificar conexão Wi-Fi a cada 30 segundos
+
+// Controle Não-Bloqueante do Reset da Bomba
+bool reset_em_andamento = false;
+unsigned long tempo_inicio_reset = 0;
+
+// Controle de Timeout de Segurança da Sirene
+bool sirene_ativa = false;
+unsigned long tempo_inicio_sirene = 0;
+const unsigned long SIRENE_TIMEOUT_MAX = 300000; // 5 minutos máximo contínuo
 
 // Estado do LED
 int ledState = LOW;
@@ -186,7 +172,7 @@ PubSubClient client(espClient);
 Adafruit_ADS1115 ads;
 OneWire oneWire(TEMP_PIN);
 DallasTemperature sensors(&oneWire);
-Preferences preferences; // Namespace de memoria flash
+Preferences preferences; // Namespace de memória flash
 
 // Flag e Callback do WiFiManager para salvar configurações
 bool deve_salvar_config = false;
@@ -199,6 +185,7 @@ void setup_relogio();
 void callback(char* topic, byte* payload, unsigned int length);
 void processar_leitura_sensores();
 void acionamento_bombas();
+void gerenciar_temporizadores_seguranca();
 void enviar_telemetria();
 bool conectar_mqtt();
 void IRAM_ATTR flowPulseCounter();
@@ -208,6 +195,7 @@ void salvar_configuracoes();
 String getTopic(String subPath);
 void comunicacao_wifi();
 bool ler_boia_controle_pcf8574();
+void inicializar_watchdog();
 
 // ==========================================
 // Interrupção do Sensor de Vazão
@@ -226,17 +214,30 @@ String getTopic(String subPath) {
 }
 
 // ==========================================
-// Leitura da Boia Digital no PCF8574 (P0 / Pino 1)
+// Leitura da Boia Digital no PCF8574 (Fail-Safe)
 // ==========================================
 bool ler_boia_controle_pcf8574() {
   Wire.requestFrom(0x20, 1);
   if (Wire.available()) {
     byte data = Wire.read();
-    // P0 é o bit 0. O contato fechado com GND lê '0' (Nível Baixo / liga).
-    // O contato aberto (Reservatório cheio) lê '1' (Nível Cheio / desliga).
-    return (data & 0x01) != 0; // Retorna true se cheio (aberto), false se vazio (fechado)
+    falha_i2c_boia = false;
+    // P0 é o bit 0. 
+    // Aberto (Nível Cheio) = 1. Fechado com GND (Nível Baixo) = 0.
+    bool estado_bruto = ((data & 0x01) != 0);
+
+    // Antirrepique de 3 segundos para ondulações no reservatório
+    if (estado_bruto != boia_estado_bruto_anterior) {
+      boia_estado_bruto_anterior = estado_bruto;
+      tempo_filtro_boia = millis();
+    } else if (millis() - tempo_filtro_boia >= 3000) {
+      boia_controle_cheia = estado_bruto;
+    }
+    return boia_controle_cheia;
   }
-  return false; // Fallback em caso de erro na leitura I2C
+  
+  // FAIL-SAFE: Se o I2C falhar, assume reservatório cheio para não transbordar
+  falha_i2c_boia = true;
+  return true;
 }
 
 // ==========================================
@@ -266,9 +267,10 @@ void carregar_configuracoes() {
   preferences.getString("modo_ativo", "nivel").toCharArray(modo_inicial_str, sizeof(modo_inicial_str));
   preferences.getString("ctrl_tipo", "0").toCharArray(tipo_sensor_nivel_str, sizeof(tipo_sensor_nivel_str));
 
-  // Lê também o totalizador de vazão
+  // Totalizador de vazão persistente
   volume_total_litros = preferences.getDouble("v_litros", 0.0);
   volume_total_m3 = volume_total_litros / 1000.0;
+  last_saved_volume_litros = volume_total_litros;
 
   preferences.end();
 
@@ -321,15 +323,19 @@ void salvar_configuracoes() {
   preferences.putString("ctrl_tipo", tipo_sensor_nivel_str);
 
   preferences.end();
-  Serial.println("Configuracoes salvas com sucesso na Flash NVS.");
+  Serial.println("Configurações salvas com sucesso na Flash NVS.");
 }
 
 // ==========================================
-// Wi-Fi: Gerenciador de Configuração WiFiManager
+// Wi-Fi: Gerenciador com Timeout Resiliente
 // ==========================================
 void comunicacao_wifi() {
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
+
+  // Timeout de 180 segundos no portal. Se ninguém configurar, segue a execução local!
+  wm.setConfigPortalTimeout(180);
+  wm.setConnectTimeout(20);
 
   // Instanciação dos parâmetros adicionais no portal web
   WiFiManagerParameter custom_modo_inicial("modo_op", "Modo Inicial (nivel, relogio, remoto)", modo_inicial_str, 10);
@@ -349,7 +355,6 @@ void comunicacao_wifi() {
   WiFiManagerParameter custom_hora_fim("h_fim", "Hora Fim Relogio", hora_fim_str, 5);
   WiFiManagerParameter custom_min_fim("m_fim", "Min Fim Relogio", min_fim_str, 5);
 
-  // Adiciona os parâmetros adicionais na página web
   wm.addParameter(&custom_modo_inicial);
   wm.addParameter(&custom_tipo_sensor);
   wm.addParameter(&custom_sys_name);
@@ -367,37 +372,55 @@ void comunicacao_wifi() {
   wm.addParameter(&custom_hora_fim);
   wm.addParameter(&custom_min_fim);
 
-  Serial.println("Abrindo gerenciador de conexao WiFiManager...");
+  Serial.println("Iniciando conexão Wi-Fi (Timeout de portal: 180s)...");
   bool res = wm.autoConnect("AutoConnectAP", "password");
 
   if (!res) {
-    Serial.println("Falha na conexao. Continuando sem internet...");
+    Serial.println("Aviso: Timeout no portal de configuração Wi-Fi. Continuando operação local...");
   } else {
-    Serial.println("Wi-Fi Conectado!");
+    Serial.println("Wi-Fi Conectado com sucesso!");
     
-    // Se o usuário alterou dados na página web de configuração, salva na flash
     if (deve_salvar_config) {
-      strcpy(modo_inicial_str, custom_modo_inicial.getValue());
-      strcpy(tipo_sensor_nivel_str, custom_tipo_sensor.getValue());
-      strcpy(sys_name, custom_sys_name.getValue());
-      strcpy(sub_name, custom_sub_name.getValue());
-      strcpy(unit_name, custom_unit_name.getValue());
-      strcpy(mqtt_broker, custom_mqtt_server.getValue());
-      strcpy(mqtt_port_str, custom_mqtt_port.getValue());
-      strcpy(mqtt_username, custom_mqtt_user.getValue());
-      strcpy(mqtt_password, custom_mqtt_pass.getValue());
-      strcpy(calib_factor_str, custom_calib_factor.getValue());
-      strcpy(nivel_liga_str, custom_nivel_liga.getValue());
-      strcpy(nivel_desliga_str, custom_nivel_desliga.getValue());
-      strcpy(hora_inicio_str, custom_hora_ini.getValue());
-      strcpy(min_inicio_str, custom_min_ini.getValue());
-      strcpy(hora_fim_str, custom_hora_fim.getValue());
-      strcpy(min_fim_str, custom_min_fim.getValue());
+      strncpy(modo_inicial_str, custom_modo_inicial.getValue(), sizeof(modo_inicial_str) - 1);
+      strncpy(tipo_sensor_nivel_str, custom_tipo_sensor.getValue(), sizeof(tipo_sensor_nivel_str) - 1);
+      strncpy(sys_name, custom_sys_name.getValue(), sizeof(sys_name) - 1);
+      strncpy(sub_name, custom_sub_name.getValue(), sizeof(sub_name) - 1);
+      strncpy(unit_name, custom_unit_name.getValue(), sizeof(unit_name) - 1);
+      strncpy(mqtt_broker, custom_mqtt_server.getValue(), sizeof(mqtt_broker) - 1);
+      strncpy(mqtt_port_str, custom_mqtt_port.getValue(), sizeof(mqtt_port_str) - 1);
+      strncpy(mqtt_username, custom_mqtt_user.getValue(), sizeof(mqtt_username) - 1);
+      strncpy(mqtt_password, custom_mqtt_pass.getValue(), sizeof(mqtt_password) - 1);
+      strncpy(calib_factor_str, custom_calib_factor.getValue(), sizeof(calib_factor_str) - 1);
+      strncpy(nivel_liga_str, custom_nivel_liga.getValue(), sizeof(nivel_liga_str) - 1);
+      strncpy(nivel_desliga_str, custom_nivel_desliga.getValue(), sizeof(nivel_desliga_str) - 1);
+      strncpy(hora_inicio_str, custom_hora_ini.getValue(), sizeof(hora_inicio_str) - 1);
+      strncpy(min_inicio_str, custom_min_ini.getValue(), sizeof(min_inicio_str) - 1);
+      strncpy(hora_fim_str, custom_hora_fim.getValue(), sizeof(hora_fim_str) - 1);
+      strncpy(min_fim_str, custom_min_fim.getValue(), sizeof(min_fim_str) - 1);
 
       salvar_configuracoes();
-      carregar_configuracoes(); // Atualiza as variáveis de trabalho com os novos dados
+      carregar_configuracoes();
     }
   }
+}
+
+// ==========================================
+// Watchdog Timer de Hardware
+// ==========================================
+void inicializar_watchdog() {
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&twdt_config);
+  esp_task_wdt_add(NULL);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+  esp_task_wdt_add(NULL);
+#endif
+  Serial.printf("Watchdog Timer ativado (%d segundos).\n", WDT_TIMEOUT_SECONDS);
 }
 
 // ==========================================
@@ -405,7 +428,7 @@ void comunicacao_wifi() {
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- ESP32 AUTO POCO INICIANDO ---");
+  Serial.println("\n--- ESP32 AUTO POCO INICIANDO (V11.0 ROBUSTO) ---");
 
   // Configuração das Entradas (Optoacopladas)
   pinMode(sistema_automatico, INPUT);
@@ -425,48 +448,68 @@ void setup() {
   digitalWrite(acionar_sirene, LOW);
   digitalWrite(K4, LOW);
 
-  // Primeiro carrega as configurações da Flash (se existirem)
+  // Carrega configurações da Flash
   carregar_configuracoes();
 
   // Inicialização do Barramento I2C e Conversor ADS1115
-  Wire.begin(21, 22); // SDA = 21, SCL = 22
+  Wire.begin(21, 22);
+  Wire.setTimeOut(50); // Timeout de 50ms para evitar bloqueios na I2C
   if (!ads.begin(0x48, &Wire)) {
-    Serial.println("Erro: Conversor ADS1115 nao encontrado!");
+    Serial.println("Alerta: Conversor ADS1115 não detectado no I2C!");
   } else {
-    ads.setGain(GAIN_ONE); // 1x gain   +/- 4.096V  1 bit = 0.125mV
+    ads.setGain(GAIN_ONE);
     Serial.println("ADS1115 inicializado com sucesso.");
   }
 
-  // Inicialização do Sensor de Temperatura
+  // Inicialização Assíncrona do Sensor DS18B20 (Sem bloqueio de 750ms!)
   sensors.begin();
-  Serial.println("Sensor de Temperatura DS18B20 inicializado.");
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures();
+  Serial.println("Sensor de Temperatura DS18B20 configurado (Modo Assíncrono).");
 
   // Configuração do Sensor de Vazão (Interrupt no GPIO 15)
   pinMode(FLOW_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowPulseCounter, FALLING);
-  Serial.println("Sensor de vazao configurado no GPIO 15.");
+  Serial.println("Sensor de vazão configurado no GPIO 15.");
 
-  // Configuração Wi-Fi (WiFiManager) e Carregamento de Parâmetros
+  // Configuração Wi-Fi (WiFiManager)
   comunicacao_wifi();
 
-  // Configuração do Cliente MQTT
+  // Configuração do Cliente MQTT com Buffer Expandido
   client.setServer(mqtt_broker, mqtt_port);
   client.setCallback(callback);
+  client.setBufferSize(1024); // CRÍTICO: Permite envio completo do payload JSON de 400+ bytes!
 
   // Inicializa o relógio NTP
   setup_relogio();
+
+  // Ativa o Watchdog de Hardware
+  inicializar_watchdog();
 }
 
 // ==========================================
 // Loop Principal
 // ==========================================
 void loop() {
+  // Alimenta o Watchdog Timer
+  esp_task_wdt_reset();
+
   unsigned long currentMillis = millis();
 
-  // 1. Lógica do painel e acionamentos físicos
+  // 1. Gerenciamento de segurança física e acionamento da bomba
   acionamento_bombas();
+  gerenciar_temporizadores_seguranca();
 
-  // 2. Reconexão MQTT Não-Bloqueante
+  // 2. Verificação e Reconexão Wi-Fi Ativa
+  if (currentMillis - lastWiFiCheck >= wifiCheckInterval) {
+    lastWiFiCheck = currentMillis;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Aviso: Conexão Wi-Fi perdida. Tentando reconectar...");
+      WiFi.reconnect();
+    }
+  }
+
+  // 3. Reconexão MQTT Não-Bloqueante
   if (WiFi.status() == WL_CONNECTED) {
     if (!client.connected()) {
       if (currentMillis - lastMqttRetry >= mqttRetryInterval) {
@@ -480,7 +523,7 @@ void loop() {
     }
   }
 
-  // 3. Processamento das leituras físicas (Média temporal)
+  // 4. Processamento das leituras físicas (Média temporal)
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
@@ -490,16 +533,43 @@ void loop() {
     // Lê sensores locais e calcula vazão/nível
     processar_leitura_sensores();
 
-    // 4. Envio periódico da Telemetria via MQTT
+    // 5. Envio periódico da Telemetria via MQTT
     if (client.connected() && (currentMillis - lastTelemetryPublish >= telemetryInterval)) {
       lastTelemetryPublish = currentMillis;
       enviar_telemetria();
     }
 
-    // 5. Salva na Flash periodicamente (a cada 10 min)
+    // 6. Salva na Flash periodicamente (se houver alteração acumulada)
     if (currentMillis - lastFlashSaveTime >= flashSaveInterval) {
       lastFlashSaveTime = currentMillis;
-      salvar_volume();
+      if (volume_total_litros != last_saved_volume_litros) {
+        salvar_volume();
+      }
+    }
+  }
+}
+
+// ==========================================
+// Temporizadores Não-Bloqueantes de Segurança
+// ==========================================
+void gerenciar_temporizadores_seguranca() {
+  unsigned long agora = millis();
+
+  // Pulso do Relé de Reset da Bomba (1 segundo)
+  if (reset_em_andamento) {
+    if (agora - tempo_inicio_reset >= 1000) {
+      digitalWrite(reset_bomba, LOW);
+      reset_em_andamento = false;
+      Serial.println("Pulso de reset finalizado com sucesso.");
+    }
+  }
+
+  // Auto-Desligamento da Sirene de Alarme (Máximo 5 minutos)
+  if (sirene_ativa) {
+    if (agora - tempo_inicio_sirene >= SIRENE_TIMEOUT_MAX) {
+      digitalWrite(acionar_sirene, LOW);
+      sirene_ativa = false;
+      Serial.println("Segurança: Timeout atingido. Sirene desligada automaticamente!");
     }
   }
 }
@@ -517,7 +587,7 @@ void processar_leitura_sensores() {
     if (nivel_mA < 3.6 || nivel_mA > 21.0) {
       falha_sensor_nivel = true;
       nivel_percentual = 0.0;
-      Serial.printf("ALERTA DE FALHA: Cabo rompido ou sensor de nivel em curto! (Leitura: %.2fmA)\n", nivel_mA);
+      Serial.printf("ALERTA: Cabo rompido ou sensor de nível em curto! (Leitura: %.2fmA)\n", nivel_mA);
     } else {
       falha_sensor_nivel = false;
       nivel_percentual = ((nivel_mA - 4.0) / 16.0) * 100.0;
@@ -527,10 +597,10 @@ void processar_leitura_sensores() {
   } 
   // --- LEITURA DO NÍVEL DIGITAL (Boia de controle no PCF8574) ---
   else {
-    falha_sensor_nivel = false; // Desativa falha analógica
-    nivel_mA = 0.0;             // Inutilizado
+    falha_sensor_nivel = falha_i2c_boia;
+    nivel_mA = 0.0;
     boia_controle_cheia = ler_boia_controle_pcf8574();
-    nivel_percentual = boia_controle_cheia ? 100.0 : 0.0; // Representa 0 ou 100%
+    nivel_percentual = boia_controle_cheia ? 100.0 : 0.0;
   }
 
   // --- LEITURA DE VAZÃO (Cálculo de Pulsos) ---
@@ -544,29 +614,28 @@ void processar_leitura_sensores() {
   volume_total_litros += (vazao_l_min / 60.0);
   volume_total_m3 = volume_total_litros / 1000.0;
 
-  // --- LEITURA DE TEMPERATURA (DS18B20 no GPIO 14) ---
+  // --- LEITURA NÃO-BLOQUEANTE DE TEMPERATURA ---
   if (millis() - lastTempRead >= tempReadInterval) {
     lastTempRead = millis();
-    sensors.requestTemperatures();
     float t = sensors.getTempCByIndex(0);
-    if (t != DEVICE_DISCONNECTED_C) {
+    if (t != DEVICE_DISCONNECTED_C && t > -50.0 && t < 125.0) {
       temperatura_c = t;
-    } else {
-      Serial.println("Erro: Sensor de temperatura desconectado!");
     }
+    // Dispara nova leitura assíncrona para a próxima amostragem
+    sensors.requestTemperatures();
   }
 
   // Debug Serial local
   String desc_sensor = (tipo_sensor_nivel == 0) ? "Danfoss" : "Boia";
   if (falha_sensor_nivel) {
-    Serial.printf("[%s/%s/%s] STATUS: [ALERTA DE NIVEL (%s)] | Vazao: %.2f L/m | Vol: %.3f m3 | Temp: %.1fC\n", 
+    Serial.printf("[%s/%s/%s] STATUS: [ALERTA DE FALHA (%s)] | Vazão: %.2f L/m | Vol: %.3f m3 | Temp: %.1fC\n", 
                   sys_name, sub_name, unit_name, desc_sensor.c_str(), vazao_l_min, volume_total_m3, temperatura_c);
   } else {
     if (tipo_sensor_nivel == 0) {
-      Serial.printf("[%s/%s/%s] STATUS: Nivel (%s): %.1f%% (%.2fmA) | Vazao: %.2f L/m | Vol: %.3f m3 | Temp: %.1fC\n", 
+      Serial.printf("[%s/%s/%s] STATUS: Nível (%s): %.1f%% (%.2fmA) | Vazão: %.2f L/m | Vol: %.3f m3 | Temp: %.1fC\n", 
                     sys_name, sub_name, unit_name, desc_sensor.c_str(), nivel_percentual, nivel_mA, vazao_l_min, volume_total_m3, temperatura_c);
     } else {
-      Serial.printf("[%s/%s/%s] STATUS: Nivel (%s): %s | Vazao: %.2f L/m | Vol: %.3f m3 | Temp: %.1fC\n", 
+      Serial.printf("[%s/%s/%s] STATUS: Nível (%s): %s | Vazão: %.2f L/m | Vol: %.3f m3 | Temp: %.1fC\n", 
                     sys_name, sub_name, unit_name, desc_sensor.c_str(), boia_controle_cheia ? "CHEIO" : "BAIXO", vazao_l_min, volume_total_m3, temperatura_c);
     }
   }
@@ -576,11 +645,11 @@ void processar_leitura_sensores() {
 // Lógica de Acionamento da Bomba (Segurança)
 // ==========================================
 void acionamento_bombas() {
-  bool is_ccm_automatico = (digitalRead(sistema_automatico) == LOW); // LOW = Automatico
+  bool is_ccm_automatico = (digitalRead(sistema_automatico) == LOW); // LOW = Automático
   bool raw_defeito       = (digitalRead(bomba_defeito) == HIGH);    // HIGH = Aberto/Falha
-  bool raw_falta         = (digitalRead(falta_fase_ou_nivel) == HIGH); // HIGH = Aberto/Falha (Fase ou Boia ativada)
+  bool raw_falta         = (digitalRead(falta_fase_ou_nivel) == HIGH); // HIGH = Aberto/Falha
   
-  // 1. Debounce das falhas fisicas (2 segundos)
+  // 1. Debounce das falhas físicas (2 segundos)
   if (raw_defeito) {
     if (tempo_defeito_bomba == 0) tempo_defeito_bomba = millis();
     else if (millis() - tempo_defeito_bomba >= DEBOUNCE_DELAY) {
@@ -601,7 +670,7 @@ void acionamento_bombas() {
     falta_fase_confirmado = false;
   }
 
-  // 2. Seletor do painel em MANUAL
+  // 2. Seletor do painel em MANUAL -> Libera contator imediatamente
   if (!is_ccm_automatico) {
     digitalWrite(ligar_bomba, LOW);
     return;
@@ -613,7 +682,7 @@ void acionamento_bombas() {
     return;
   }
 
-  // Rastreia se houve alteração no estado da bomba para salvar na flash
+  // Rastreia se a bomba desligou para persistir volume na Flash
   bool bomba_ligada_agora = (digitalRead(bomba_ligada) == LOW);
   if (ultima_bomba_ligada && !bomba_ligada_agora) {
     salvar_volume();
@@ -623,7 +692,7 @@ void acionamento_bombas() {
   // 4. MODO AUTOMÁTICO DE NÍVEL
   if (modo_atual == MODO_NIVEL) {
     if (tipo_sensor_nivel == 0) {
-      // Controle via Danfoss 4-20mA
+      // Controle Danfoss 4-20mA com Histerese
       if (nivel_percentual <= nivel_liga) {
         digitalWrite(ligar_bomba, HIGH);
       } 
@@ -631,11 +700,11 @@ void acionamento_bombas() {
         digitalWrite(ligar_bomba, LOW);
       }
     } else {
-      // Controle via Boia Digital Comum (pino P0 do PCF8574)
+      // Controle via Boia Digital Comum
       if (!boia_controle_cheia) {
-        digitalWrite(ligar_bomba, HIGH); // Reservatório vazio -> Liga
+        digitalWrite(ligar_bomba, HIGH); // Vazio -> Liga
       } else {
-        digitalWrite(ligar_bomba, LOW);  // Reservatório cheio -> Desliga
+        digitalWrite(ligar_bomba, LOW);  // Cheio -> Desliga
       }
     }
   } 
@@ -656,7 +725,7 @@ void acionamento_bombas() {
       }
 
       if (dentro_horario) {
-        // Horário ativo: Liga, a menos que o reservatório já esteja cheio
+        // Horário ativo: Liga, exceto se o reservatório já estiver cheio
         if (tipo_sensor_nivel == 0 && nivel_percentual >= nivel_desliga) {
           digitalWrite(ligar_bomba, LOW); // Trava Danfoss
         } 
@@ -664,17 +733,17 @@ void acionamento_bombas() {
           digitalWrite(ligar_bomba, LOW); // Trava Boia Digital
         } 
         else {
-          digitalWrite(ligar_bomba, HIGH); // Nível ok: aciona bomba
+          digitalWrite(ligar_bomba, HIGH);
         }
       } else {
-        digitalWrite(ligar_bomba, LOW); // Fora do horário configurado
+        digitalWrite(ligar_bomba, LOW);
       }
     } else {
-      digitalWrite(ligar_bomba, LOW); // Sem sincronização NTP
+      digitalWrite(ligar_bomba, LOW); // Sem horário NTP válido
     }
   } 
   
-  // 6. MODO REMOTO (Controle MQTT direto)
+  // 6. MODO REMOTO (Comando direto via MQTT)
   else if (modo_atual == MODO_REMOTO) {
     if (rem_ligar_bomba == 1) {
       digitalWrite(ligar_bomba, HIGH);
@@ -691,14 +760,15 @@ void salvar_volume() {
   preferences.begin("poco3", false);
   preferences.putDouble("v_litros", volume_total_litros);
   preferences.end();
-  Serial.printf(">>> [NVS FLASH] Volume total salvo na Flash: %.2f L (%.3f m3)\n", volume_total_litros, volume_total_m3);
+  last_saved_volume_litros = volume_total_litros;
+  Serial.printf(">>> [NVS FLASH] Volume total salvo: %.2f L (%.3f m3)\n", volume_total_litros, volume_total_m3);
 }
 
 // ==========================================
 // Configuração do Horário (SNTP / NTP)
 // ==========================================
 void timeavailable(struct timeval *t) {
-  Serial.println("Relogio atualizado com sucesso via NTP!");
+  Serial.println("Relógio atualizado com sucesso via NTP!");
 }
 
 void setup_relogio() {
@@ -736,26 +806,26 @@ void callback(char* topic, byte* payload, unsigned int length) {
     messageTemp += (char)payload[i];
   }
   
-  Serial.printf("Mensagem MQTT recebida no topico: %s | Conteudo: %s\n", topic, messageTemp.c_str());
+  Serial.printf("Mensagem MQTT recebida no tópico: %s | Conteúdo: %s\n", topic, messageTemp.c_str());
   String topicStr = String(topic);
 
-  // 1. Comando de Modo de Operação (Sincroniza com o boot/NVS)
+  // 1. Comando de Modo de Operação
   if (topicStr == getTopic("cmd/modo")) {
     if (messageTemp == "nivel") {
       modo_atual = MODO_NIVEL;
-      strcpy(modo_inicial_str, "nivel");
+      strncpy(modo_inicial_str, "nivel", sizeof(modo_inicial_str) - 1);
       salvar_configuracoes();
-      Serial.println("Modo alterado para: NIVEL (Salvo como padrão)");
+      Serial.println("Modo alterado para: NIVEL");
     } else if (messageTemp == "relogio") {
       modo_atual = MODO_RELOGIO;
-      strcpy(modo_inicial_str, "relogio");
+      strncpy(modo_inicial_str, "relogio", sizeof(modo_inicial_str) - 1);
       salvar_configuracoes();
-      Serial.println("Modo alterado para: RELOGIO (Salvo como padrão)");
+      Serial.println("Modo alterado para: RELOGIO");
     } else if (messageTemp == "remoto") {
       modo_atual = MODO_REMOTO;
-      strcpy(modo_inicial_str, "remoto");
+      strncpy(modo_inicial_str, "remoto", sizeof(modo_inicial_str) - 1);
       salvar_configuracoes();
-      Serial.println("Modo alterado para: REMOTO (Salvo como padrão)");
+      Serial.println("Modo alterado para: REMOTO");
     }
   } 
   
@@ -770,9 +840,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
   } 
   
-  // 3. Configuração de Janela Horária do Modo Relógio (Salva em Flash)
+  // 3. Configuração de Janela Horária do Modo Relógio
   else if (topicStr == getTopic("cmd/config/horario")) {
-    StaticJsonDocument<200> doc;
+    StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, messageTemp);
     if (!error) {
       if (doc.containsKey("h_ini")) hora_inicio = doc["h_ini"];
@@ -780,22 +850,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
       if (doc.containsKey("h_fim")) hora_fim = doc["h_fim"];
       if (doc.containsKey("m_fim")) min_fim = doc["m_fim"];
       
-      sprintf(hora_inicio_str, "%d", hora_inicio);
-      sprintf(min_inicio_str, "%d", min_inicio);
-      sprintf(hora_fim_str, "%d", hora_fim);
-      sprintf(min_fim_str, "%d", min_fim);
+      snprintf(hora_inicio_str, sizeof(hora_inicio_str), "%d", hora_inicio);
+      snprintf(min_inicio_str, sizeof(min_inicio_str), "%d", min_inicio);
+      snprintf(hora_fim_str, sizeof(hora_fim_str), "%d", hora_fim);
+      snprintf(min_fim_str, sizeof(min_fim_str), "%d", min_fim);
       
       salvar_configuracoes();
-      Serial.printf("Config Horaria: das %02d:%02d as %02d:%02d (Salvo na Flash)\n", 
+      Serial.printf("Config Horária: das %02d:%02d às %02d:%02d\n", 
                     hora_inicio, min_inicio, hora_fim, min_fim);
-    } else {
-      Serial.println("Falha ao analisar JSON de configuracao horaria.");
     }
   } 
   
-  // 4. Configuração de Setpoints de Nível (Salva em Flash)
+  // 4. Configuração de Setpoints de Nível
   else if (topicStr == getTopic("cmd/config/setpoints")) {
-    StaticJsonDocument<200> doc;
+    StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, messageTemp);
     if (!error) {
       if (doc.containsKey("nivel_liga")) nivel_liga = doc["nivel_liga"];
@@ -805,31 +873,31 @@ void callback(char* topic, byte* payload, unsigned int length) {
       dtostrf(nivel_desliga, 4, 1, nivel_desliga_str);
       
       salvar_configuracoes();
-      Serial.printf("Setpoints de Nivel: Liga com %.1f%% | Desliga com %.1f%% (Salvo na Flash)\n", 
+      Serial.printf("Setpoints de Nível: Liga com %.1f%% | Desliga com %.1f%%\n", 
                     nivel_liga, nivel_desliga);
-    } else {
-      Serial.println("Falha ao analisar JSON de setpoints de nivel.");
     }
   } 
   
-  // 5. Comando de Reset do Rele Térmico (Pulso em K2)
+  // 5. Comando de Reset do Relé Térmico (Pulso NÃO-BLOQUEANTE de 1s)
   else if (topicStr == getTopic("cmd/reset")) {
     if (messageTemp == "1") {
-      Serial.println("Enviando pulso de Reset na Bomba (K2)...");
+      Serial.println("Iniciando pulso de reset na Bomba (K2)...");
       digitalWrite(reset_bomba, HIGH);
-      delay(1000); // Pulso de 1 segundo
-      digitalWrite(reset_bomba, LOW);
-      Serial.println("Pulso de reset concluido.");
+      reset_em_andamento = true;
+      tempo_inicio_reset = millis();
     }
   }
 
-  // 6. Comando para acionar a Sirene de Alarme (Relé K3)
+  // 6. Comando para acionar a Sirene de Alarme (Relé K3 com Auto-Timeout)
   else if (topicStr == getTopic("cmd/sirene")) {
     if (messageTemp == "1") {
       digitalWrite(acionar_sirene, HIGH);
-      Serial.println("SIRENE ATIVADA VIA MQTT!");
+      sirene_ativa = true;
+      tempo_inicio_sirene = millis();
+      Serial.println("SIRENE ATIVADA VIA MQTT! (Auto-timeout: 5 min)");
     } else if (messageTemp == "0") {
       digitalWrite(acionar_sirene, LOW);
+      sirene_ativa = false;
       Serial.println("Sirene desligada via MQTT.");
     }
   }
@@ -839,7 +907,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // Envio de Telemetria via MQTT (Publicação)
 // ==========================================
 void enviar_telemetria() {
-  StaticJsonDocument<500> doc;
+  StaticJsonDocument<768> doc;
   
   String str_modo = "nivel";
   if (modo_atual == MODO_RELOGIO) str_modo = "relogio";
@@ -864,7 +932,7 @@ void enviar_telemetria() {
   controle["nivel_liga"] = nivel_liga;
   controle["nivel_desliga"] = nivel_desliga;
   controle["nivel_falha"] = falha_sensor_nivel;
-  controle["boia_controle_cheia"] = boia_controle_cheia; // Status da boia de controle digital
+  controle["boia_controle_cheia"] = boia_controle_cheia;
 
   JsonObject sensores = doc.createNestedObject("sensores");
   sensores["vazao_l_min"] = round(vazao_l_min * 10.0) / 10.0;
@@ -874,12 +942,12 @@ void enviar_telemetria() {
   doc["uptime_s"] = millis() / 1000;
 
   // Serializa e envia
-  char buffer[512];
+  char buffer[768];
   serializeJson(doc, buffer);
   
   String t_topic = getTopic("telemetria");
   if (client.publish(t_topic.c_str(), buffer)) {
-    Serial.printf("Telemetria enviada via MQTT no topico: %s\n", t_topic.c_str());
+    Serial.printf("Telemetria enviada via MQTT no tópico: %s\n", t_topic.c_str());
   } else {
     Serial.println("Erro ao publicar telemetria no broker.");
   }
