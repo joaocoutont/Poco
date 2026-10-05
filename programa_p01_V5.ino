@@ -60,7 +60,7 @@
 // ==========================================
 // Configurações Wi-Fi e MQTT Broker (Variáveis Editáveis)
 // ==========================================
-char mqtt_broker[40] = "187.52.106.194";
+char mqtt_broker[40] = "138.118.3.53";
 char mqtt_port_str[6] = "1883";
 int mqtt_port = 1883;
 char mqtt_username[40] = "sanear";
@@ -246,7 +246,7 @@ bool ler_boia_controle_pcf8574() {
 void carregar_configuracoes() {
   preferences.begin("poco3", false);
 
-  preferences.getString("mqtt_host", "187.52.106.194").toCharArray(mqtt_broker, sizeof(mqtt_broker));
+  preferences.getString("mqtt_host", "138.118.3.53").toCharArray(mqtt_broker, sizeof(mqtt_broker));
   preferences.getString("mqtt_port", "1883").toCharArray(mqtt_port_str, sizeof(mqtt_port_str));
   preferences.getString("mqtt_user", "sanear").toCharArray(mqtt_username, sizeof(mqtt_username));
   preferences.getString("mqtt_pass", "sanear#123").toCharArray(mqtt_password, sizeof(mqtt_password));
